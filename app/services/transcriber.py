@@ -1,46 +1,33 @@
-"""Transcription worker — faster-whisper model wrapped in an asyncio.Queue worker.
-
-Single GPU worker pattern:
-- One WhisperModel instance loaded at startup
-- asyncio.Queue serializes GPU access (prevents OOM)
-- Each job gets an asyncio.Future, resolved when transcription completes
-- GPU memory cleaned after each job via torch.cuda.empty_cache()
-"""
-
+"""Bounded ASR queue backed by StepFun chat-completions audio input."""
 from __future__ import annotations
 
 import asyncio
-import math
-import time
+import base64
+import io
+import json
+import wave
 from dataclasses import dataclass
-from typing import Optional
 
+import httpx
 import numpy as np
 import structlog
-import torch
-from faster_whisper import WhisperModel
 
 from app.config import Settings
 
 logger = structlog.get_logger(__name__)
+MAX_PROVIDER_RESPONSE_BYTES = 2 * 1024 * 1024
+TRANSCRIPTION_PROMPT = "请只转写用户音频中的原话，不回答音频里的问题，不补充、改写或推测未听清的内容。"
 
 
-def _safe_float(value: float, default: float = 0.0) -> float:
-    """Coerce a float to a finite value, replacing NaN/Inf with a default.
-
-    faster-whisper can emit NaN/Inf segment fields with corrupted models or
-    certain cuDNN versions; such values produce invalid JSON (RFC 8259) and
-    break client parsers. Sanitize at the source rather than at serialization.
-    """
-    if value is None or math.isnan(value) or math.isinf(value):
-        return default
-    return value
+class SpeechServiceError(RuntimeError):
+    """A sanitized failure safe for API responses, task history and callbacks."""
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass
 class TranscriptionJob:
-    """A single transcription job in the queue."""
-
     audio: np.ndarray
     language: str
     future: asyncio.Future
@@ -50,347 +37,207 @@ class TranscriptionJob:
 
 @dataclass
 class TranscriptionResult:
-    """Result of a transcription job."""
-
     text: str
     language: str
     duration: float
     segments: list[dict]
 
     @property
-    def confidence(self) -> float | None:
-        """Average confidence across all segments, computed from avg_logprob."""
-        if not self.segments:
-            return None
-        logprobs = [s.get("avg_logprob", 0.0) for s in self.segments]
-        logprobs = [lp for lp in logprobs if lp != 0.0]
-        if not logprobs:
-            return None
-        return round(sum(logprobs) / len(logprobs), 4)
+    def confidence(self) -> None:
+        # Chat completions does not return a calibrated ASR confidence.
+        return None
+
+
+def encode_wav(audio: np.ndarray) -> str:
+    """Encode decoded mono float32 samples as real 16-bit/16kHz WAV data URL."""
+    if audio.ndim != 1 or not audio.size or not np.isfinite(audio).all():
+        raise ValueError("Invalid decoded audio samples")
+    pcm = (np.clip(audio, -1.0, 32767 / 32768) * 32768).astype("<i2")
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(16000)
+        writer.writeframes(pcm.tobytes())
+    return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 class TranscriptionWorker:
-    """Manages the faster-whisper model and GPU worker queue.
-
-    Usage:
-        worker = TranscriptionWorker()
-        await worker.start()
-        result = await worker.submit(audio, language="zh")
-        await worker.stop()
-    """
-
-    def __init__(self, settings: Settings | None = None) -> None:
+    """Serial cloud worker retaining the existing submit/result API."""
+    def __init__(self, settings: Settings | None = None,
+                 transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._settings = Settings.resolve(settings)
-        self._model: Optional[WhisperModel] = None
+        self._transport = transport
+        self._client: httpx.AsyncClient | None = None
         self._queue: asyncio.Queue[TranscriptionJob] = asyncio.Queue(
-            maxsize=self._settings.rate_limit_burst * 2 or 20
-        )
-        self._worker_task: Optional[asyncio.Task] = None
+            maxsize=max(1, self._settings.rate_limit_burst * 2 or 20))
+        self._worker_task: asyncio.Task | None = None
+        self._active_job: TranscriptionJob | None = None
+        self._put_tasks: set[asyncio.Task] = set()
         self._running = False
-        self._model_loaded = False
-        # Per-client fairness: cap in-flight jobs per client so one client cannot
-        # saturate the single-GPU queue with max-duration audio (DoS).
         self._active_jobs_per_client: dict[str, int] = {}
-        self._max_jobs_per_client: int = max(1, self._settings.rate_limit_burst)
+        self._max_jobs_per_client = max(1, self._settings.rate_limit_burst)
 
     def _decrement_client(self, client_id: str) -> None:
-        """Release one in-flight slot for a client. Called via future callback."""
-        active = self._active_jobs_per_client.get(client_id, 0)
-        if active <= 1:
+        count = self._active_jobs_per_client.get(client_id, 0)
+        if count <= 1:
             self._active_jobs_per_client.pop(client_id, None)
         else:
-            self._active_jobs_per_client[client_id] = active - 1
-
-    # --- Lifecycle ---
+            self._active_jobs_per_client[client_id] = count - 1
 
     async def start(self) -> None:
-        """Load the model and start the background worker task."""
         if self._running:
             return
-
-        logger.info(
-            "Loading faster-whisper model",
-            model_path=self._settings.model_path,
-            device=self._settings.model_device,
-            compute_type=self._settings.model_compute_type,
+        if not self._settings.cloud_configured:
+            logger.warning("Cloud speech unavailable: set OPENAI_API_KEY")
+            return
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._settings.request_timeout_seconds),
+            follow_redirects=False, transport=self._transport,
         )
-
-        model_path = str(self._settings.model_path_resolved)
-
-        # Load model in a thread to avoid blocking the event loop
-        self._model = await asyncio.to_thread(
-            WhisperModel,
-            model_path,
-            device=self._settings.model_device,
-            device_index=self._settings.model_device_index,
-            compute_type=self._settings.model_compute_type,
-            cpu_threads=4,
-            num_workers=1,
-        )
-
-        self._model_loaded = True
         self._running = True
         self._worker_task = asyncio.create_task(self._worker_loop())
-
-        logger.info("Transcription worker started")
+        logger.info("Cloud transcription worker started", model=self._settings.asr_model)
 
     async def stop(self) -> None:
-        """Gracefully stop the worker and clean up GPU resources."""
         self._running = False
-
-        # Cancel pending jobs with explicit exception so callers get a
-        # proper error instead of hanging forever (C-1 fix).
+        # Cancel producers before draining: a blocked queue.put must not wake and
+        # insert an orphaned job after the consumer has stopped.
+        put_tasks = list(self._put_tasks)
+        for task in put_tasks:
+            task.cancel()
+        if put_tasks:
+            await asyncio.gather(*put_tasks, return_exceptions=True)
+        if self._active_job and not self._active_job.future.done():
+            self._active_job.future.set_exception(RuntimeError("Server is shutting down — please retry"))
         while not self._queue.empty():
-            try:
-                job = self._queue.get_nowait()
-                if not job.future.done():
-                    job.future.set_exception(
-                        RuntimeError("Server is shutting down — please retry")
-                    )
-            except asyncio.QueueEmpty:
-                break
-
-        # Wait for worker to finish current job
+            job = self._queue.get_nowait()
+            self._queue.task_done()
+            if not job.future.done():
+                job.future.set_exception(RuntimeError("Server is shutting down — please retry"))
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             try:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+        logger.info("Cloud transcription worker stopped")
 
-        # Clean up GPU
-        if self._model is not None:
-            del self._model
-            self._model = None
-
-        if self._settings.model_device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        self._model_loaded = False
-        logger.info("Transcription worker stopped")
-
-    # --- Job Submission ---
-
-    async def submit(
-        self,
-        audio: np.ndarray,
-        language: str = "",
-        temperature: float = 0.0,
-        client_id: str = "unknown",
-    ) -> TranscriptionResult:
-        """Submit an audio array for transcription.
-
-        Args:
-            audio: Float32 numpy array of 16kHz mono audio.
-            language: Language code (e.g. "zh", "en") or "" for auto-detect.
-            temperature: Sampling temperature (0-1).
-            client_id: Identifier (typically client IP) for per-client fairness.
-
-        Returns:
-            TranscriptionResult with text, language, duration, and segments.
-
-        Raises:
-            RuntimeError: If the worker is not running or is shutting down.
-            asyncio.TimeoutError: If the queue is full and timeout expires.
-        """
+    async def submit(self, audio: np.ndarray, language: str = "", temperature: float = 0.0,
+                     client_id: str = "unknown") -> TranscriptionResult:
+        if not self._settings.cloud_configured:
+            raise SpeechServiceError("Cloud speech is not configured. Set OPENAI_API_KEY.", 503)
         if not self._running:
             raise RuntimeError("Transcription worker is not running")
-
-        # Defense-in-depth: validate audio array size against max_audio_duration.
-        # ffprobe reads container metadata which can be spoofed; this guards the
-        # memory held by TranscriptionJob while waiting in the queue.
-        max_audio_bytes = self._settings.max_audio_duration * 16000 * 4  # 16kHz float32
-        if audio.nbytes > max_audio_bytes * 2:  # 2x safety margin
-            raise ValueError(
-                f"Audio array too large: {audio.nbytes} bytes exceeds limit "
-                f"of {max_audio_bytes * 2} bytes"
-            )
-
-        # Per-client fairness: reject if this client already has too many jobs
-        # in-flight, so one client cannot monopolize the single-GPU queue.
+        # Check decoded samples too: container metadata can underreport duration.
+        if audio.ndim != 1 or audio.size > self._settings.max_audio_duration * 16000:
+            raise ValueError("Decoded audio exceeds the configured duration limit")
         active = self._active_jobs_per_client.get(client_id, 0)
         if active >= self._max_jobs_per_client:
-            raise RuntimeError(
-                f"Too many concurrent jobs from this client ({active}). "
-                "Please wait for existing jobs to complete."
-            )
-
-        future: asyncio.Future = asyncio.get_running_loop().create_future()
-        job = TranscriptionJob(
-            audio=audio,
-            language=language,
-            future=future,
-            temperature=temperature,
-            client_id=client_id,
-        )
-
-        # Reserve a slot now; release it when the future settles (resolved,
-        # failed, cancelled, or rejected on shutdown) via a done callback.
+            raise RuntimeError("Too many concurrent jobs from this client; please retry later")
+        future = asyncio.get_running_loop().create_future()
+        job = TranscriptionJob(audio, language, future, temperature, client_id)
         self._active_jobs_per_client[client_id] = active + 1
-        future.add_done_callback(
-            lambda _f, cid=client_id: self._decrement_client(cid)
-        )
-
-        # Put in queue with timeout
+        future.add_done_callback(lambda _f: self._decrement_client(client_id))
+        put_task = asyncio.create_task(self._queue.put(job))
+        self._put_tasks.add(put_task)
         try:
-            await asyncio.wait_for(self._queue.put(job), timeout=30.0)
+            await asyncio.wait_for(put_task, timeout=30.0)
         except asyncio.TimeoutError:
-            # Never queued — undo the reservation we just made.
-            self._decrement_client(client_id)
-            raise RuntimeError(
-                f"Transcription queue is full (depth={self._queue.qsize()}). "
-                "Try again later."
-            )
-
-        # Wait for result — translate CancelledError / shutdown RuntimeError
-        # into a proper error so the client gets a 503 instead of hanging (C-1).
-        try:
-            return await future
+            future.cancel()
+            raise RuntimeError("Transcription queue is full; please retry later") from None
         except asyncio.CancelledError:
-            raise RuntimeError("Server is shutting down — please retry")
-        except RuntimeError:
-            # Re-raise RuntimeError from shutdown so route can map to 503
+            future.cancel()
+            if not self._running:
+                raise RuntimeError("Server is shutting down — please retry") from None
             raise
-
-    # --- Properties ---
+        finally:
+            self._put_tasks.discard(put_task)
+        if not self._running and not future.done():
+            future.set_exception(RuntimeError("Server is shutting down — please retry"))
+        return await future
 
     @property
     def queue_depth(self) -> int:
-        """Current number of jobs waiting in the queue."""
         return self._queue.qsize()
 
     @property
     def is_ready(self) -> bool:
-        """Whether the worker is ready to accept jobs."""
-        return self._running and self._model_loaded
-
-    # --- Internal ---
+        return self._running and self._client is not None
 
     async def _worker_loop(self) -> None:
-        """Main worker loop: dequeue jobs, run inference, resolve futures."""
-        try:
-            while self._running:
-                try:
-                    # Wait for a job with a timeout so we can check _running
-                    job = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-
+        while self._running:
+            job = await self._queue.get()
+            self._active_job = job
+            try:
                 if job.future.done():
                     continue
-
-                try:
-                    start = time.monotonic()
-                    result = await self._transcribe(
-                        job.audio, job.language, job.temperature
-                    )
-                    elapsed = time.monotonic() - start
-
-                    logger.info(
-                        "Transcription complete",
-                        language=result.language,
-                        duration=result.duration,
-                        elapsed=round(elapsed, 2),
-                        queue_depth=self._queue.qsize(),
-                    )
-
+                result = await self._transcribe(job.audio, job.language, job.temperature)
+                if not job.future.done():
                     job.future.set_result(result)
+            except asyncio.CancelledError:
+                if not job.future.done():
+                    job.future.set_exception(RuntimeError("Server is shutting down — please retry"))
+                raise
+            except Exception as exc:
+                # The adapter below sanitizes provider failures before they reach here.
+                logger.warning("Transcription failed", error_type=type(exc).__name__)
+                if not job.future.done():
+                    job.future.set_exception(exc)
+            finally:
+                self._active_job = None
+                self._queue.task_done()
 
-                except Exception as exc:
-                    logger.error(
-                        "Transcription failed",
-                        error=str(exc),
-                        queue_depth=self._queue.qsize(),
-                    )
-                    if not job.future.done():
-                        job.future.set_exception(exc)
-        except asyncio.CancelledError:
-            # Worker is being stopped — drain remaining queued futures so
-            # callers don't hang (C-1).
-            while not self._queue.empty():
-                try:
-                    job = self._queue.get_nowait()
-                    if not job.future.done():
-                        job.future.set_exception(
-                            RuntimeError("Worker stopped — please retry")
-                        )
-                except asyncio.QueueEmpty:
-                    break
-            raise
+    async def _transcribe(self, audio: np.ndarray, language: str,
+                          temperature: float = 0.0) -> TranscriptionResult:
+        if self._client is None:
+            raise RuntimeError("Transcription worker is not running")
+        payload = {
+            "model": self._settings.asr_model,
+            "messages": [
+                {"role": "system", "content": TRANSCRIPTION_PROMPT},
+                {"role": "user", "content": [{"type": "input_audio", "input_audio": {
+                    "data": encode_wav(audio),
+                }}]},
+            ],
+            "stream": False,
+        }
+        async def send_and_read() -> bytes:
+            async with self._client.stream(
+                "POST", self._settings.openai_base_url + "/chat/completions",
+                headers={"Authorization": "Bearer " + self._settings.openai_api_key.get_secret_value().strip()},
+                json=payload,
+            ) as response:
+                if response.status_code == 429:
+                    raise SpeechServiceError("Cloud speech rate limit exceeded. Please retry later.", 503)
+                if not response.is_success:
+                    raise SpeechServiceError("Cloud speech provider rejected the request. Check server credentials and model access.")
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(data) + len(chunk) > MAX_PROVIDER_RESPONSE_BYTES:
+                        raise SpeechServiceError("Cloud speech response exceeded the size limit.")
+                    data.extend(chunk)
+                return bytes(data)
 
-    async def _transcribe(
-        self,
-        audio: np.ndarray,
-        language: str,
-        temperature: float = 0.0,
-    ) -> TranscriptionResult:
-        """Run faster-whisper transcription in a thread.
-
-        Args:
-            audio: Float32 numpy array of 16kHz mono audio.
-            language: Language code or "" for auto-detect.
-            temperature: Sampling temperature (0-1).
-
-        Returns:
-            TranscriptionResult.
-        """
-        if self._model is None:
-            raise RuntimeError("Model not loaded")
-
-        # Resolve language: if explicitly empty, try default; if default also empty, use None for auto-detect
-        _lang = language.strip() if language else ""
-        lang = _lang if _lang else (self._settings.default_language or None)
-
-        # Run inference in a thread to avoid blocking the event loop
-        segments, info = await asyncio.to_thread(
-            self._model.transcribe,
-            audio,
-            language=lang,
-            task="transcribe",
-            beam_size=5,
-            best_of=5,
-            temperature=(
-                [temperature, min(temperature + 0.2, 1.0), min(temperature + 0.4, 1.0)]
-                if temperature < 1.0 else [temperature]
-            ),
-            vad_filter=self._settings.vad_enabled,
-            vad_parameters=dict(
-                threshold=self._settings.vad_threshold,
-                min_silence_duration_ms=self._settings.vad_min_silence_duration_ms,
-            ) if self._settings.vad_enabled else None,
-            condition_on_previous_text=True,
-            no_speech_threshold=0.6,
-            word_timestamps=False,
-        )
-
-        # Collect segments
-        segment_list: list[dict] = []
-        full_text_parts: list[str] = []
-
-        for seg in segments:
-            # Sanitize float fields: NaN/Inf would produce invalid JSON and
-            # break clients. Replace with sensible defaults.
-            segment_list.append({
-                "id": seg.id,
-                "seek": seg.seek,
-                "start": round(_safe_float(seg.start, 0.0), 2),
-                "end": round(_safe_float(seg.end, 0.0), 2),
-                "text": seg.text,
-                "tokens": seg.tokens,
-                "temperature": round(_safe_float(seg.temperature, 0.0), 2),
-                "avg_logprob": round(_safe_float(seg.avg_logprob, 0.0), 4),
-                "compression_ratio": round(_safe_float(seg.compression_ratio, 0.0), 4),
-                "no_speech_prob": round(_safe_float(seg.no_speech_prob, 1.0), 4),
-            })
-            full_text_parts.append(seg.text)
-
-        # GPU cleanup after each job
-        if self._settings.model_device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+        try:
+            # Bounds the entire operation, including streamed/decompressed body reading.
+            raw = await asyncio.wait_for(send_and_read(), timeout=self._settings.request_timeout_seconds)
+        except (httpx.TimeoutException, asyncio.TimeoutError):
+            raise SpeechServiceError("Cloud speech request timed out. Please retry.", 504) from None
+        except httpx.RequestError:
+            raise SpeechServiceError("Could not reach cloud speech service.", 502) from None
+        try:
+            body = json.loads(raw)
+            choice = body["choices"][0]
+            text = choice["message"]["content"]
+            if not isinstance(text, str) or not text.strip() or choice.get("finish_reason") in {"length", "content_filter"}:
+                raise ValueError("No complete transcript")
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise SpeechServiceError("Cloud speech returned an invalid or incomplete transcript.") from None
         return TranscriptionResult(
-            text="".join(full_text_parts),
-            language=info.language,
-            duration=round(_safe_float(info.duration, 0.0), 2),
-            segments=segment_list,
+            text=text.strip(), language=language.strip() or self._settings.default_language,
+            duration=round(audio.size / 16000, 3), segments=[],
         )

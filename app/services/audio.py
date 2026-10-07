@@ -27,7 +27,7 @@ def decode_audio_ffmpeg(file_path: str | Path, sr: int = 16000) -> np.ndarray:
 
     Args:
         file_path: Path to the audio file.
-        sr: Target sample rate (default 16000 for Whisper).
+        sr: Target sample rate (default 16000).
 
     Returns:
         Float32 numpy array of shape (n_samples,).
@@ -86,7 +86,7 @@ def decode_audio_ffmpeg(file_path: str | Path, sr: int = 16000) -> np.ndarray:
     raw = np.frombuffer(proc.stdout, dtype=np.int16)
     audio = raw.astype(np.float32) / 32768.0
 
-    # Reject all-silence audio early — saves GPU inference time and gives the
+    # Reject all-silence audio early — saves a cloud request and gives the
     # client a clear error instead of an empty transcription.
     if float(np.max(np.abs(audio))) < 1e-6:
         raise HTTPException(

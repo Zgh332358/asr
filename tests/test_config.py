@@ -23,22 +23,16 @@ class TestSettingsDefaults:
 
     def test_model_defaults(self):
         s = Settings()
-        assert s.model_path == "models/whisper-large-v3-turbo-ct2"
-        assert s.model_compute_type == "float16"
-        assert s.model_device == "cuda"
-        assert s.model_device_index == 0
+        assert s.asr_model == "stepaudio-3-chat-preview"
+        assert s.openai_base_url == "https://api.stepfun.com/v1"
+        assert s.cloud_configured is False
+        assert s.request_timeout_seconds == 120
 
     def test_audio_limits_defaults(self):
         s = Settings()
         assert s.max_upload_bytes == 524_288_000
         assert s.max_audio_duration == 600
         assert s.default_language == "zh"
-
-    def test_vad_defaults(self):
-        s = Settings()
-        assert s.vad_enabled is True
-        assert s.vad_threshold == 0.5
-        assert s.vad_min_silence_duration_ms == 500
 
     def test_rate_limit_defaults(self):
         s = Settings()
@@ -70,12 +64,6 @@ class TestSettingsProperties:
         s = Settings(cors_origins="https://a.com, https://b.com")
         assert s.cors_origins_list == ["https://a.com", "https://b.com"]
 
-    def test_model_path_resolved(self):
-        s = Settings(model_path="models/test-model")
-        resolved = s.model_path_resolved
-        assert isinstance(resolved, Path)
-        assert resolved.is_absolute()
-
     def test_temp_dir_resolved(self):
         s = Settings(temp_dir="/tmp/test_whisper")
         resolved = s.temp_dir_resolved
@@ -91,10 +79,10 @@ class TestSettingsEnvOverride:
         s = Settings()
         assert s.port == 9090
 
-    def test_env_override_model_device(self, monkeypatch):
-        monkeypatch.setenv("MODEL_DEVICE", "cpu")
+    def test_env_override_model(self, monkeypatch):
+        monkeypatch.setenv("ASR_MODEL", "configured-model")
         s = Settings()
-        assert s.model_device == "cpu"
+        assert s.asr_model == "configured-model"
 
     def test_env_override_log_level(self, monkeypatch):
         monkeypatch.setenv("LOG_LEVEL", "debug")
@@ -114,3 +102,22 @@ class TestSettingsExtraForbid:
         """Passing an unknown kwarg to Settings() should raise ValidationError."""
         with pytest.raises(Exception):  # pydantic ValidationError
             Settings(model_paths="/wrong/path")  # typo: model_paths vs model_path
+
+
+def test_api_key_is_redacted():
+    s = Settings(openai_api_key="test-secret-must-not-print")
+    assert s.cloud_configured
+    assert "test-secret-must-not-print" not in repr(s)
+    assert "test-secret-must-not-print" not in s.model_dump_json()
+
+
+@pytest.mark.parametrize("url", ["http://api.stepfun.com/v1", "https://user:pass@api.stepfun.com/v1", "https://api.stepfun.com/v1?key=secret", "https://api.stepfun.com/v1#x"])
+def test_base_url_rejects_unsafe_config(url):
+    with pytest.raises(ValueError):
+        Settings(openai_base_url=url)
+
+
+def test_template_is_valid():
+    s = Settings(_env_file=".env.example")
+    assert not s.cloud_configured
+    assert s.asr_model == "stepaudio-3-chat-preview"

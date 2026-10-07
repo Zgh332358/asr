@@ -6,8 +6,8 @@
 # already runs as root (no password needed for systemctl).
 
 [Unit]
-Description=Whisper ASR Auto-Update Check
-Documentation=https://github.com/revoice-resonance/asr
+Description=StepFun ASR Auto-Update Check
+Documentation=https://github.com/Zgh332358/asr
 After=network-online.target
 Wants=network-online.target
 

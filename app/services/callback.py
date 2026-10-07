@@ -75,7 +75,6 @@ async def notify_main_backend(
                             "Callback rejected by main backend",
                             task_id=task_id,
                             status_code=response.status_code,
-                            body=response.text[:500],
                         )
                     else:
                         logger.info(
@@ -95,7 +94,7 @@ async def notify_main_backend(
                     attempt=attempt + 1,
                     max_retries=_max_retries,
                     delay=delay,
-                    error=str(last_exc),
+                    error_type=type(last_exc).__name__ if last_exc else "HTTPError",
                 )
                 await asyncio.sleep(delay)
 
@@ -103,6 +102,6 @@ async def notify_main_backend(
         "Callback exhausted all retries",
         task_id=task_id,
         max_retries=_max_retries,
-        last_error=str(last_exc),
+        last_error_type=type(last_exc).__name__ if last_exc else "HTTPError",
     )
     return False

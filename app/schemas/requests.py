@@ -25,8 +25,8 @@ class CorpusCreateRequest(BaseModel):
         description="Tags for categorization and filtering.",
     )
     asr_engine: str = Field(
-        default="WHISPER",
-        pattern=r"^(WHISPER|AZURE|ALIYUN|TENCENT|HUAWEI)$",
+        default="STEPFUN",
+        pattern=r"^STEPFUN$",
         description="ASR engine to use.",
     )
     engine_config: dict = Field(

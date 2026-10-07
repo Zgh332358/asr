@@ -1,5 +1,5 @@
 # /etc/systemd/system/whisper-asr.service
-# Whisper ASR API — main server service
+# StepFun Cloud ASR API — main server service
 #
 # Installation (via deploy.sh):
 #   bash deploy.sh install-systemd
@@ -10,11 +10,11 @@
 #   sudo cp deploy/systemd/whisper-asr-update.timer /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now whisper-asr.service
-#   sudo systemctl enable --now whisper-asr-update.timer
+#   # Auto-update timer is optional; enable separately after reviewing it.
 
 [Unit]
-Description=Whisper ASR API Server
-Documentation=https://github.com/revoice-resonance/asr
+Description=StepFun Cloud ASR API Server
+Documentation=https://github.com/Zgh332358/asr
 After=network-online.target
 Wants=network-online.target
 
@@ -28,13 +28,8 @@ WorkingDirectory=/opt/whisper-asr
 # The leading "-" means "ignore if file missing"
 EnvironmentFile=-/opt/whisper-asr/.env
 
-# Start via uvicorn in the venv
-# ${VAR:-default} syntax is systemd's own variable expansion from EnvironmentFile
-ExecStart=/opt/whisper-asr/venv/bin/python -m uvicorn app.main:app \
-    --host ${HOST:-0.0.0.0} \
-    --port ${PORT:-8080} \
-    --log-level ${LOG_LEVEL:-info} \
-    --workers 1
+# Python reads HOST, PORT, and other settings from EnvironmentFile.
+ExecStart=/opt/whisper-asr/venv/bin/python -m app.main
 
 # Graceful shutdown: SIGTERM with 35s timeout before SIGKILL
 TimeoutStopSec=35
@@ -45,8 +40,6 @@ KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=10
 
-# GPU needs memlock for CUDA
-LimitMEMLOCK=infinity
 LimitNOFILE=65536
 
 # Logging to journald

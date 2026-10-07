@@ -43,13 +43,15 @@ async def find_corpus_by_md5(db: AsyncSession, md5: str) -> Corpus | None:
     return result.scalar_one_or_none()
 
 
-async def find_successful_task(db: AsyncSession, corpus_id: int) -> AsrTask | None:
-    """Find the latest successful ASR task for a corpus."""
+async def find_successful_task(db: AsyncSession, corpus_id: int, model: str) -> AsrTask | None:
+    """Find a successful result for this corpus and the configured provider/model."""
     result = await db.execute(
         select(AsrTask)
         .where(
             AsrTask.corpus_id == corpus_id,
             AsrTask.status == "SUCCESS",
+            AsrTask.asr_engine == "STEPFUN",
+            AsrTask.engine_config["model"].astext == model,
         )
         .order_by(AsrTask.completed_at.desc())
         .limit(1)
@@ -166,7 +168,7 @@ async def list_corpora(
 async def create_task(
     db: AsyncSession,
     corpus_id: int,
-    asr_engine: str = "WHISPER",
+    asr_engine: str = "STEPFUN",
     engine_config: dict | None = None,
 ) -> AsrTask:
     """Create a new ASR task in PENDING status."""

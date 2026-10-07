@@ -28,6 +28,9 @@ class ReadyResponse(BaseModel):
     status: str
     model_loaded: bool
     gpu_available: bool
+    provider: str = "stepfun"
+    configured: bool = False
+    model: str = ""
 
 
 class GPUInfoResponse(BaseModel):

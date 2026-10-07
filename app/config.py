@@ -8,12 +8,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar
 
-from pydantic import field_validator
+from pydantic import Field, SecretStr, field_validator
+from urllib.parse import urlsplit
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Whisper ASR API settings.
+    """StepFun ASR API settings.
 
     Loaded from .env file and environment variables (env vars take precedence).
     """
@@ -30,25 +31,16 @@ class Settings(BaseSettings):
     port: int = 8080
     cors_origins: str = ""  # comma-separated, e.g. "https://app.example.com,https://admin.example.com"
 
-    # --- Model ---
-    model_path: str = "models/whisper-large-v3-turbo-ct2"
-    model_compute_type: str = "float16"
-    model_device: str = "cuda"
-    model_device_index: int = 0
-
-    # --- Model Download ---
-    model_download_url: str = ""
-    hf_model_id: str = ""
+    # --- Cloud speech model (server-only credentials) ---
+    openai_api_key: SecretStr = SecretStr("")
+    openai_base_url: str = "https://api.stepfun.com/v1"
+    asr_model: str = "stepaudio-3-chat-preview"
+    request_timeout_seconds: float = Field(default=120.0, ge=1, le=600)
 
     # --- Audio Limits ---
     max_upload_bytes: int = 524_288_000  # 500 MB
     max_audio_duration: int = 600  # 10 minutes
     default_language: str = "zh"
-
-    # --- VAD ---
-    vad_enabled: bool = True
-    vad_threshold: float = 0.5
-    vad_min_silence_duration_ms: int = 500
 
     # --- Rate Limiting ---
     rate_limit_rpm: int = 60  # requests per minute, 0 = disabled
@@ -85,24 +77,22 @@ class Settings(BaseSettings):
 
     # --- Validators ---
 
-    @field_validator("model_device")
+    @field_validator("openai_base_url")
     @classmethod
-    def validate_device(cls, v: str) -> str:
-        valid = {"cpu", "cuda", "auto"}
-        if v not in valid:
-            raise ValueError(f"model_device must be one of {valid}, got '{v}'")
-        return v
+    def validate_base_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        parsed = urlsplit(value)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
+            raise ValueError("OPENAI_BASE_URL must be an HTTPS URL without credentials, query or fragment")
+        return value
 
-    @field_validator("model_compute_type")
+    @field_validator("asr_model")
     @classmethod
-    def validate_compute_type(cls, v: str) -> str:
-        valid = {
-            "default", "auto", "int8", "int8_float16", "int8_float32",
-            "int8_bfloat16", "int16", "float16", "float32", "bfloat16",
-        }
-        if v not in valid:
-            raise ValueError(f"model_compute_type must be one of {valid}, got '{v}'")
-        return v
+    def validate_model(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("ASR_MODEL must not be empty")
+        return value.strip()
 
     @field_validator("log_level")
     @classmethod
@@ -133,9 +123,8 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
-    def model_path_resolved(self) -> Path:
-        """Resolve model path (expand ~ and make absolute)."""
-        return Path(self.model_path).expanduser().resolve()
+    def cloud_configured(self) -> bool:
+        return bool(self.openai_api_key.get_secret_value().strip())
 
     @property
     def temp_dir_resolved(self) -> Path:

@@ -12,6 +12,7 @@ def clean_settings(monkeypatch):
     Unsets all WHISPER/APP-related env vars that might leak from the host.
     """
     env_vars_to_clear = [
+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "ASR_MODEL", "REQUEST_TIMEOUT_SECONDS", "DATABASE_URL",
         "HOST", "PORT", "CORS_ORIGINS", "MODEL_PATH", "MODEL_COMPUTE_TYPE",
         "MODEL_DEVICE", "MODEL_DEVICE_INDEX", "MODEL_DOWNLOAD_URL", "HF_MODEL_ID",
         "MAX_UPLOAD_BYTES", "MAX_AUDIO_DURATION", "DEFAULT_LANGUAGE",

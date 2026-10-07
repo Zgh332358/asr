@@ -1,4 +1,4 @@
-"""Whisper ASR API — FastAPI application entry point.
+"""StepFun ASR API — FastAPI application entry point.
 
 Usage:
     python -m app.main
@@ -8,7 +8,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import sys
 from contextlib import asynccontextmanager
 
 import structlog
@@ -65,8 +64,7 @@ def setup_logging() -> None:
     )
 
     # Silence noisy libraries
-    logging.getLogger("faster_whisper").setLevel(logging.WARNING)
-    logging.getLogger("ctranslate2").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy").setLevel(logging.WARNING)
 
 
@@ -75,39 +73,22 @@ def setup_logging() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: init DB, load model, start scheduler, cleanup."""
+    """Application lifespan: init DB, start cloud worker and scheduler, cleanup."""
     logger = structlog.get_logger(__name__)
 
-    logger.info("Starting Whisper ASR API server")
+    logger.info("Starting StepFun ASR API server")
 
     # --- Database ---
     if settings.database_enabled:
-        logger.info(
-            "Initializing database",
-            database_url=settings.database_url.split("@")[-1] if "@" in settings.database_url else "(set)",
-        )
+        logger.info("Initializing database")
         await init_database()
         logger.info("Database connected")
     else:
         logger.info("Database not configured — running in stateless mode")
 
-    # --- Model ---
-    model_path = settings.model_path_resolved
-    if not model_path.exists():
-        logger.error(
-            "Model path not found",
-            path=str(model_path),
-            hint="Set MODEL_PATH env var or run deploy.sh to download the model",
-        )
-        sys.exit(1)
-
+    # --- Cloud worker (the app can start without a key) ---
     worker = TranscriptionWorker(settings=settings)
-    try:
-        await worker.start()
-    except Exception:
-        logger.exception("Failed to load model")
-        sys.exit(1)
-
+    await worker.start()
     app.state.worker = worker
 
     # --- Task Scheduler (DB-backed mode only) ---
@@ -127,32 +108,23 @@ async def lifespan(app: FastAPI):
         "Server ready",
         host=settings.host,
         port=settings.port,
-        model_path=str(model_path),
-        device=settings.model_device,
+        model=settings.asr_model,
+        cloud_configured=settings.cloud_configured,
         database_enabled=settings.database_enabled,
         rate_limit=f"{settings.rate_limit_rpm}/min" if settings.rate_limit_rpm > 0 else "disabled",
-        effective_settings=settings.model_dump(
-            exclude={"http_proxy", "https_proxy", "model_download_url", "main_backend_callback_url"}
-        ),
+
     )
 
-    yield
-
-    # --- Shutdown ---
-    logger.info("Shutting down server")
-
-    if scheduler is not None:
-        await scheduler.stop()
-        logger.info("Task scheduler stopped")
-
-    await worker.stop()
-    logger.info("GPU worker stopped")
-
-    if settings.database_enabled:
-        await close_database()
-        logger.info("Database disconnected")
-
-    logger.info("Server stopped")
+    try:
+        yield
+    finally:
+        logger.info("Shutting down server")
+        if scheduler is not None:
+            await scheduler.stop()
+        await worker.stop()
+        if settings.database_enabled:
+            await close_database()
+        logger.info("Server stopped")
 
 
 # --- App Factory ---
@@ -163,8 +135,8 @@ def create_app() -> FastAPI:
     setup_logging()
 
     app = FastAPI(
-        title="Whisper ASR API",
-        description="Production-grade speech-to-text API powered by faster-whisper",
+        title="StepFun ASR API",
+        description="Speech-to-text API backed by StepFun cloud speech",
         version="1.0.0",
         lifespan=lifespan,
         docs_url="/docs" if settings.log_format == "console" else None,

@@ -4,7 +4,7 @@ The TaskScheduler runs as a background asyncio task. It periodically queries
 the database for PENDING tasks, atomically claims them, and delegates the full
 processing pipeline to TaskProcessor.
 
-This sits ABOVE the TranscriptionWorker — the worker remains a pure GPU queue.
+This sits ABOVE the TranscriptionWorker — the worker remains a bounded cloud queue.
 The scheduler is the DB-aware orchestrator that feeds it.
 """
 
@@ -28,7 +28,7 @@ class TaskScheduler:
     For each pending task found:
     1. Atomically claim (UPDATE status='PROCESSING', started_at=NOW())
     2. Delegate to TaskProcessor for audio load → decode → transcribe → store → callback
-    3. On failure: mark FAILED, retry up to task_max_retries
+    3. On failure: mark FAILED; a new upload can create a retry task
 
     The scheduler respects max_concurrent_tasks — it won't claim more tasks
     than the configured limit.
@@ -52,7 +52,9 @@ class TaskScheduler:
         self._processor = TaskProcessor(session_factory, worker, settings)
         self._running = False
         self._task: asyncio.Task | None = None
+        self._claim_task: asyncio.Task | None = None
         self._active_count = 0
+        self._active_tasks: set[asyncio.Task] = set()
         self._max_concurrent = max(1, self._settings.max_concurrent_tasks)
 
     @property
@@ -84,6 +86,18 @@ class TaskScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # A committed claim must be registered before we cancel processing jobs.
+        # The polling task awaits this critical section through shield().
+        if self._claim_task is not None:
+            await self._claim_task
+            self._claim_task = None
+        # Let newly created jobs enter the processor's cancellation handler.
+        await asyncio.sleep(0)
+        # Cancel and await jobs so their processor can persist interruption as FAILED.
+        for task in list(self._active_tasks):
+            task.cancel()
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
         logger.info("Task scheduler stopped", remaining_tasks=self._active_count)
 
     async def _poll_loop(self) -> None:
@@ -91,7 +105,7 @@ class TaskScheduler:
         while self._running:
             try:
                 # Check for PENDING tasks if we have capacity
-                while self._active_count < self._max_concurrent:
+                while self._worker.is_ready and self._active_count < self._max_concurrent:
                     task_claimed = await self._try_claim_and_process()
                     if not task_claimed:
                         break  # No more PENDING tasks
@@ -109,13 +123,26 @@ class TaskScheduler:
 
         Returns True if a task was claimed, False if none available.
         """
+        if not self._worker.is_ready:
+            return False
+        self._claim_task = asyncio.create_task(self._claim_and_register())
+        try:
+            return await asyncio.shield(self._claim_task)
+        finally:
+            if self._claim_task is not None and self._claim_task.done():
+                self._claim_task = None
+
+    async def _claim_and_register(self) -> bool:
+        """Never cancel between committing a claim and tracking its processor."""
         claimed = await self._processor.try_claim()
         if claimed is None:
             return False
 
-        task_id, corpus_id, audio_path = claimed
+        task_id, corpus_id, audio_path, language = claimed
         self._active_count += 1
-        asyncio.create_task(self._process_and_track(task_id, corpus_id, audio_path))
+        task = asyncio.create_task(self._process_and_track(task_id, corpus_id, audio_path, language))
+        self._active_tasks.add(task)
+        task.add_done_callback(self._active_tasks.discard)
         return True
 
     async def _process_and_track(
@@ -123,9 +150,10 @@ class TaskScheduler:
         task_id: int,
         corpus_id: int,
         audio_path: str,
+        language: str,
     ) -> None:
         """Delegate to TaskProcessor and manage active_count tracking."""
         try:
-            await self._processor.process(task_id, corpus_id, audio_path)
+            await self._processor.process(task_id, corpus_id, audio_path, language)
         finally:
             self._active_count -= 1

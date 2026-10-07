@@ -108,7 +108,7 @@ async def upload_corpus(
     business_id: str | None = Form(default=None, description="Business ID (e.g., patient ID)."),
     business_type: str | None = Form(default=None, description="Business type."),
     tags: str = Form(default="", description="Comma-separated tags."),
-    asr_engine: str = Form(default="WHISPER", description="ASR engine to use."),
+    asr_engine: str = Form(default="STEPFUN", description="ASR engine; this fork supports STEPFUN only."),
     db: AsyncSession = Depends(get_db),
 ) -> RecognizeResponse:
     """Upload an audio file for ASR processing.
@@ -119,6 +119,10 @@ async def upload_corpus(
     The task will be picked up by the background TaskScheduler for processing.
     """
     _require_db()
+    if asr_engine != "STEPFUN":
+        raise HTTPException(status_code=400, detail="Only STEPFUN is supported for new tasks.")
+    if not request.app.state.worker.is_ready:
+        raise HTTPException(status_code=503, detail="Cloud speech is not ready. Set OPENAI_API_KEY.")
 
     # Parse tags
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
@@ -143,7 +147,7 @@ async def upload_corpus(
         existing = await find_corpus_by_md5(db, md5)
         if existing is not None:
             # Check for an existing successful task
-            cached_task = await find_successful_task(db, existing.id)
+            cached_task = await find_successful_task(db, existing.id, settings.asr_model)
             if cached_task is not None:
                 cleanup_temp_file(decoded.temp_path)
                 await db.commit()
@@ -194,7 +198,8 @@ async def upload_corpus(
         task = await create_task(
             db,
             corpus_id=corpus.id,
-            asr_engine=asr_engine,
+            asr_engine="STEPFUN",
+            engine_config={"model": settings.asr_model, "protocol": "chat_audio"},
         )
 
         await db.commit()

@@ -45,9 +45,9 @@ class AsrTask(Base, TimestampMixin):
     )
     asr_engine: Mapped[str] = mapped_column(
         String(30),
-        default="WHISPER",
+        default="STEPFUN",
         nullable=False,
-        comment="ASR引擎: WHISPER, AZURE, ALIYUN, TENCENT, HUAWEI",
+        comment="ASR引擎: STEPFUN, WHISPER, AZURE, ALIYUN, TENCENT, HUAWEI",
     )
     engine_config: Mapped[dict] = mapped_column(
         JSONB, default=dict, nullable=False, comment="引擎配置参数"

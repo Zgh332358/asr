@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Whisper ASR API — Non-invasive Deployment Script
+# StepFun Cloud ASR API — Non-invasive Deployment Script
 # =============================================================================
-# Designed for AutoDL and similar GPU cloud environments.
+# Runs the cloud gateway in an isolated Python environment.
 # - Creates an isolated venv (does NOT touch system Python)
-# - Downloads model from bucket or converts from HuggingFace
+# - No local model download or GPU is required
 # - Manages the server via PID file
-# - Supports HTTP proxy for pip and model downloads
+# - Supports HTTP proxy for pip installs
 #
 # Usage:
 #   bash deploy.sh start          # Start the server
@@ -14,7 +14,7 @@
 #   bash deploy.sh restart        # Restart the server
 #   bash deploy.sh status         # Check server status
 #   bash deploy.sh logs [N]       # Tail last N lines of logs (default 50)
-#   bash deploy.sh setup          # Install deps + download model (no start)
+#   bash deploy.sh setup          # Install dependencies (no start)
 #   bash deploy.sh update         # Git pull + pip install + restart
 #   bash deploy.sh auto-update    # Start background auto-update daemon
 #   bash deploy.sh auto-update-stop # Stop the auto-update daemon
@@ -36,20 +36,6 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-# Fallback: read MODEL_URL file if MODEL_DOWNLOAD_URL not set
-if [ -z "${MODEL_DOWNLOAD_URL:-}" ] && [ -f "MODEL_URL" ]; then
-    # Read first non-comment, non-empty line from MODEL_URL
-    MODEL_DOWNLOAD_URL=$(grep -v '^\s*#' MODEL_URL | grep -v '^\s*$' | head -1 | tr -d '[:space:]')
-    if [ -n "$MODEL_DOWNLOAD_URL" ]; then
-        # Validate URL starts with https://
-        if [[ "$MODEL_DOWNLOAD_URL" != https://* ]]; then
-            echo "[ERROR] MODEL_URL must start with https://, got: $MODEL_DOWNLOAD_URL"
-            exit 1
-        fi
-        echo "[INFO]  Read MODEL_DOWNLOAD_URL from MODEL_URL file"
-    fi
-fi
-
 # Defaults (matching .env.example)
 APP_NAME="whisper_api"
 VENV_DIR="${VENV_DIR:-venv}"
@@ -62,12 +48,9 @@ AUTO_UPDATE_INTERVAL="${AUTO_UPDATE_INTERVAL:-300}"  # seconds between checks (d
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
-MODEL_PATH="${MODEL_PATH:-models/whisper-large-v3-turbo-ct2}"
-MODEL_DOWNLOAD_URL="${MODEL_DOWNLOAD_URL:-}"
-HF_MODEL_ID="${HF_MODEL_ID:-}"
-MODEL_COMPUTE_TYPE="${MODEL_COMPUTE_TYPE:-float16}"
-MODEL_DEVICE="${MODEL_DEVICE:-cuda}"
-MODEL_DEVICE_INDEX="${MODEL_DEVICE_INDEX:-0}"
+ASR_MODEL="${ASR_MODEL:-stepaudio-3-chat-preview}"
+OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.stepfun.com/v1}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 DEFAULT_LANGUAGE="${DEFAULT_LANGUAGE:-zh}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 LOG_FORMAT="${LOG_FORMAT:-json}"
@@ -99,12 +82,12 @@ die() {
 
 setup_proxy() {
     if [ -n "$HTTP_PROXY" ]; then
-        log_info "Using HTTP proxy: $HTTP_PROXY"
+        log_info "Using configured HTTP proxy"
         export http_proxy="$HTTP_PROXY"
         export HTTP_PROXY="$HTTP_PROXY"
     fi
     if [ -n "$HTTPS_PROXY" ]; then
-        log_info "Using HTTPS proxy: $HTTPS_PROXY"
+        log_info "Using configured HTTPS proxy"
         export https_proxy="$HTTPS_PROXY"
         export HTTPS_PROXY="$HTTPS_PROXY"
     fi
@@ -123,173 +106,9 @@ check_prerequisites() {
     PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
     log_info "Python version: $PYTHON_VERSION"
 
-    # CUDA / GPU detection (must run before ffmpeg install to decide GPU vs CPU)
-    HAS_NVIDIA=false
-    if command -v nvidia-smi &>/dev/null; then
-        HAS_NVIDIA=true
-        log_info "GPU detected:"
-        nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
-    else
-        log_warn "nvidia-smi not found. GPU may not be available."
+    if ! command -v ffmpeg &>/dev/null || ! command -v ffprobe &>/dev/null; then
+        die "ffmpeg/ffprobe are required. Install them with your system package manager."
     fi
-
-    # ffmpeg
-    install_ffmpeg
-
-    # Verify ffmpeg works
-    if ! ffmpeg -version &>/dev/null; then
-        die "ffmpeg installation failed. Please install it manually."
-    fi
-    log_info "ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
-
-    # Report GPU acceleration status
-    if $HAS_NVIDIA; then
-        if ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
-            log_info "ffmpeg NVIDIA GPU acceleration: ENABLED (h264_nvenc, hevc_nvenc)"
-        else
-            log_warn "ffmpeg NVIDIA GPU acceleration: NOT available (CPU decode only)"
-        fi
-    fi
-}
-
-# --- ffmpeg Installation -------------------------------------------------------
-
-install_ffmpeg() {
-    # Already installed — done
-    if command -v ffmpeg &>/dev/null; then
-        log_info "ffmpeg already installed"
-        return 0
-    fi
-
-    log_warn "ffmpeg not found. Installing..."
-
-    # NVIDIA GPU build (opt-in via INSTALL_FFMPEG_NVIDIA=1)
-    if [ "${INSTALL_FFMPEG_NVIDIA:-0}" = "1" ] && $HAS_NVIDIA; then
-        install_ffmpeg_nvidia && return 0
-    fi
-
-    # apt-get (standard, reliable)
-    if command -v apt-get &>/dev/null; then
-        log_info "Installing ffmpeg via apt-get..."
-        if sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq ffmpeg 2>/dev/null; then
-            if command -v ffmpeg &>/dev/null; then
-                log_info "ffmpeg installed via apt-get"
-                return 0
-            fi
-        fi
-        log_warn "apt-get install failed"
-    fi
-
-    # conda fallback
-    if command -v conda &>/dev/null; then
-        log_info "Installing ffmpeg via conda-forge..."
-        if conda install -y -c conda-forge ffmpeg 2>/dev/null; then
-            if command -v ffmpeg &>/dev/null; then
-                log_info "ffmpeg installed via conda"
-                return 0
-            fi
-        fi
-        log_warn "conda install failed"
-    fi
-
-    return 1
-}
-
-install_ffmpeg_nvidia() {
-    # Download pre-built ffmpeg from BtbN/FFmpeg-Builds
-    # Includes: h264_nvenc, hevc_nvenc, h264_cuvid, hevc_cuvid, and CUDA filters
-    local BASE_URL="${FFMPEG_BASE_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest}"
-    local ARCHIVE="ffmpeg-master-latest-linux64-gpl-shared.tar.xz"
-    # Optional: set FFMPEG_SHA256 to verify the downloaded archive (supply-chain hardening).
-    local EXPECTED_SHA256="${FFMPEG_SHA256:-}"
-    local TMP_DIR="/tmp/ffmpeg_nvidia_$$"
-
-    log_info "Downloading GPU-accelerated ffmpeg (BtbN build with NVENC/NVDEC)..."
-
-    mkdir -p "$TMP_DIR"
-
-    if command -v wget &>/dev/null; then
-        wget -q --show-progress -O "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
-            log_warn "Failed to download GPU ffmpeg"
-            rm -rf "$TMP_DIR"
-            return 1
-        }
-    elif command -v curl &>/dev/null; then
-        curl -# -L -o "${TMP_DIR}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}" || {
-            log_warn "Failed to download GPU ffmpeg"
-            rm -rf "$TMP_DIR"
-            return 1
-        }
-    else
-        rm -rf "$TMP_DIR"
-        return 1
-    fi
-
-    # Verify checksum if one was provided (defense against MITM / swapped release)
-    if [ -n "$EXPECTED_SHA256" ] && command -v sha256sum &>/dev/null; then
-        local actual_sha
-        actual_sha=$(sha256sum "${TMP_DIR}/${ARCHIVE}" | cut -d' ' -f1)
-        if [ "$actual_sha" != "$EXPECTED_SHA256" ]; then
-            log_error "ffmpeg archive checksum mismatch — possible tampering"
-            log_error "  expected: $EXPECTED_SHA256"
-            log_error "  actual:   $actual_sha"
-            rm -rf "$TMP_DIR"
-            return 1
-        fi
-        log_info "ffmpeg archive checksum verified"
-    elif [ -n "$EXPECTED_SHA256" ]; then
-        log_warn "FFMPEG_SHA256 set but sha256sum not available — skipping verification"
-    fi
-
-    log_info "Extracting ffmpeg..."
-    tar -xf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR" \
-        --no-same-owner --no-same-permissions 2>/dev/null || {
-        log_warn "Failed to extract GPU ffmpeg archive"
-        rm -rf "$TMP_DIR"
-        return 1
-    }
-
-    # Find extracted directory (name varies by build date)
-    local EXTRACTED_DIR
-    EXTRACTED_DIR=$(find "$TMP_DIR" -maxdepth 1 -type d -name "ffmpeg-master-*" | head -1)
-    if [ -z "$EXTRACTED_DIR" ]; then
-        log_warn "Could not find extracted ffmpeg directory"
-        rm -rf "$TMP_DIR"
-        return 1
-    fi
-
-    # Install to /usr/local (requires sudo) or ~/.local/bin (user-local)
-    local BIN_DIR
-    if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
-        BIN_DIR="/usr/local/bin"
-        sudo cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/" 2>/dev/null || {
-            BIN_DIR="${HOME}/.local/bin"
-            mkdir -p "$BIN_DIR"
-            cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/"
-        }
-        # Install shared libraries so ffmpeg can find them
-        sudo cp -r "${EXTRACTED_DIR}/lib/"* /usr/local/lib/ 2>/dev/null || true
-        sudo ldconfig 2>/dev/null || true
-    else
-        BIN_DIR="${HOME}/.local/bin"
-        mkdir -p "$BIN_DIR"
-        cp "${EXTRACTED_DIR}/bin/ffmpeg" "${EXTRACTED_DIR}/bin/ffprobe" "$BIN_DIR/"
-        # Add to PATH for this session
-        export PATH="${HOME}/.local/bin:${PATH}"
-        log_info "Installed ffmpeg to ${HOME}/.local/bin (add to PATH if not already)"
-    fi
-
-    # Cleanup
-    rm -rf "$TMP_DIR"
-
-    # Verify NVIDIA codecs are available
-    if command -v ffmpeg &>/dev/null && ffmpeg -codecs 2>/dev/null | grep -q h264_nvenc; then
-        log_info "GPU-accelerated ffmpeg installed successfully"
-        return 0
-    fi
-
-    log_warn "GPU ffmpeg installed but NVIDIA codecs not detected (driver mismatch?)"
-    return 1
 }
 
 # --- Virtual Environment -----------------------------------------------------
@@ -318,129 +137,6 @@ setup_venv() {
     log_info "Dependencies installed successfully"
 }
 
-# --- Model Setup -------------------------------------------------------------
-
-setup_model() {
-    log_step "Setting up model..."
-
-    MODEL_DIR="$(dirname "$MODEL_PATH")"
-    mkdir -p "$MODEL_DIR"
-
-    # Case 1: Model already exists
-    if [ -f "$MODEL_PATH/model.bin" ] || [ -f "$MODEL_PATH/config.json" ]; then
-        log_info "Model already exists at $MODEL_PATH"
-        return 0
-    fi
-
-    # Case 2: Download from bucket URL
-    if [ -n "$MODEL_DOWNLOAD_URL" ]; then
-        log_info "Downloading model from $MODEL_DOWNLOAD_URL ..."
-
-        ARCHIVE="/tmp/whisper_model_$$.tar.gz"
-        if command -v wget &>/dev/null; then
-            wget -q --show-progress -O "$ARCHIVE" "$MODEL_DOWNLOAD_URL" || {
-                rm -f "$ARCHIVE"
-                die "Failed to download model"
-            }
-        elif command -v curl &>/dev/null; then
-            curl -L -o "$ARCHIVE" "$MODEL_DOWNLOAD_URL" || {
-                rm -f "$ARCHIVE"
-                die "Failed to download model"
-            }
-        else
-            die "Neither wget nor curl found"
-        fi
-
-        log_info "Extracting model..."
-        mkdir -p "$MODEL_PATH"
-        tar -xzf "$ARCHIVE" -C "$MODEL_PATH" --strip-components=1 \
-            --no-same-owner --no-same-permissions 2>/dev/null || \
-            tar -xzf "$ARCHIVE" -C "$MODEL_PATH" \
-            --no-same-owner --no-same-permissions 2>/dev/null || \
-            unzip -q "$ARCHIVE" -d "$MODEL_PATH" 2>/dev/null || \
-            die "Failed to extract model archive"
-
-        # Verify extraction did not escape MODEL_PATH (defense-in-depth)
-        if find "$MODEL_PATH" -maxdepth 1 \( -name "..*" -o -path "/*" \) 2>/dev/null | grep -q .; then
-            log_error "Model archive contains suspicious paths — aborting"
-            rm -rf "$MODEL_PATH"
-            rm -f "$ARCHIVE"
-            exit 1
-        fi
-
-        rm -f "$ARCHIVE"
-        log_info "Model downloaded and extracted to $MODEL_PATH"
-        return 0
-    fi
-
-    # Case 3: Convert from HuggingFace model
-    if [ -n "$HF_MODEL_ID" ]; then
-        log_info "Converting HuggingFace model '$HF_MODEL_ID' to CTranslate2 format..."
-
-        # Install ct2-transformers-converter if needed
-        pip install ctranslate2 -q 2>/dev/null || true
-
-        python3 -c "
-import os
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-model_id = '$HF_MODEL_ID'
-target = '$MODEL_PATH'
-os.makedirs(target, exist_ok=True)
-
-print(f'Downloading {model_id}...')
-model = WhisperForConditionalGeneration.from_pretrained(model_id)
-processor = WhisperProcessor.from_pretrained(model_id)
-
-print(f'Saving to {target}...')
-model.save_pretrained(target)
-processor.save_pretrained(target)
-print('Done. Now converting with ct2-transformers-converter...')
-" || die "Failed to download HF model"
-
-        ct2-transformers-converter \
-            --model "$MODEL_PATH" \
-            --output_dir "$MODEL_PATH" \
-            --copy_files tokenizer.json preprocessor_config.json \
-            --quantization "$MODEL_COMPUTE_TYPE" \
-            --force 2>/dev/null || {
-            log_warn "ct2-transformers-converter failed. Trying alternative method..."
-            # Alternative: use faster-whisper's built-in conversion
-            python3 -c "
-from faster_whisper.utils import download_model
-download_model('$HF_MODEL_ID', output_dir='$MODEL_PATH')
-" || die "Model conversion failed"
-        }
-
-        log_info "Model converted to CTranslate2 format at $MODEL_PATH"
-        return 0
-    fi
-
-    # Case 4: Try local HuggingFace model directory
-    LOCAL_HF_DIR="whisper-large-v3-turbo-finetuned"
-    if [ -d "$LOCAL_HF_DIR" ] && [ -f "$LOCAL_HF_DIR/config.json" ]; then
-        log_info "Found local HuggingFace model at $LOCAL_HF_DIR, converting..."
-
-        pip install ctranslate2 -q 2>/dev/null || true
-
-        ct2-transformers-converter \
-            --model "$LOCAL_HF_DIR" \
-            --output_dir "$MODEL_PATH" \
-            --copy_files tokenizer.json preprocessor_config.json \
-            --quantization "$MODEL_COMPUTE_TYPE" \
-            --force 2>/dev/null || {
-            log_warn "Automatic conversion failed."
-            log_warn "Please convert manually or set MODEL_DOWNLOAD_URL / HF_MODEL_ID in .env"
-            die "Model setup failed"
-        }
-
-        log_info "Local model converted to $MODEL_PATH"
-        return 0
-    fi
-
-    die "No model found. Set MODEL_DOWNLOAD_URL or HF_MODEL_ID in .env, or place a model at $MODEL_PATH"
-}
-
 # --- Server Management -------------------------------------------------------
 
 is_running() {
@@ -456,7 +152,7 @@ is_running() {
                 case "$cmdline" in
                     *uvicorn*|*app.main*) return 0 ;;
                     *)
-                        log_warn "PID $pid in $PID_FILE is not the Whisper server (recycled?) — ignoring"
+                        log_warn "PID $pid in $PID_FILE is not the ASR server (recycled?) — ignoring"
                         rm -f "$PID_FILE"
                         return 1
                         ;;
@@ -485,7 +181,7 @@ start_server() {
     source "$VENV_DIR/bin/activate" 2>/dev/null || source "$VENV_DIR/Scripts/activate" 2>/dev/null
 
     # Export env vars for the server process
-    export HOST PORT MODEL_PATH MODEL_COMPUTE_TYPE MODEL_DEVICE MODEL_DEVICE_INDEX
+    export HOST PORT ASR_MODEL OPENAI_BASE_URL OPENAI_API_KEY
     export DEFAULT_LANGUAGE LOG_LEVEL LOG_FORMAT
 
     # Start server in background
@@ -493,20 +189,19 @@ start_server() {
         --host "$HOST" \
         --port "$PORT" \
         --log-level "$LOG_LEVEL" \
-        # Single worker to avoid loading multiple model copies into GPU (O(n) VRAM)
         --workers 1 \
         >> "$LOG_FILE" 2>&1 &
 
     local pid=$!
     echo "$pid" > "$PID_FILE"
 
-    # Poll /health/ready until model is loaded (up to 60s)
-    log_info "Waiting for model to load..."
+    # Poll process liveness; readiness remains 503 until a key is configured
+    log_info "Waiting for server to start..."
     local waited=0
     local max_wait=60
     while [ $waited -lt $max_wait ]; do
         if command -v curl &>/dev/null; then
-            if curl -sf "http://127.0.0.1:${PORT}/health/ready" >/dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:${PORT}/health/live" >/dev/null 2>&1; then
                 break
             fi
         fi
@@ -568,8 +263,7 @@ show_status() {
         echo "  PID:       $pid"
         echo "  Host:      $HOST"
         echo "  Port:      $PORT"
-        echo "  Model:     $MODEL_PATH"
-        echo "  Device:    $MODEL_DEVICE"
+        echo "  Model:     $ASR_MODEL"
         echo "  Log file:  $LOG_FILE"
 
         # Try health check
@@ -597,8 +291,6 @@ show_logs() {
 
 GIT_REMOTE="${GIT_REMOTE:-origin}"
 GIT_BRANCH="${GIT_BRANCH:-master}"
-# Repo URL for git clone if not already a git repo
-GIT_CLONE_URL="${GIT_CLONE_URL:-https://github.com/revoice-resonance/asr.git}"
 
 do_update() {
     log_step "Checking for updates from ${GIT_REMOTE}/${GIT_BRANCH}..."
@@ -609,12 +301,16 @@ do_update() {
         return 1
     fi
 
-    # Stash any local changes so pull is clean (saves them for inspection)
+    local remote_url
+    remote_url=$(git remote get-url "$GIT_REMOTE") || die "Configured Git remote is unavailable"
+    case "$remote_url" in
+        https://github.com/Zgh332358/asr|https://github.com/Zgh332358/asr.git|git@github.com:Zgh332358/asr.git) ;;
+        *) die "Update is restricted to the Zgh332358/asr fork. Review your Git remote." ;;
+    esac
+
     local stashed=false
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-        log_info "Local changes detected — stashing before update"
-        git stash push -m "auto-update stash $(date -Iseconds)" 2>/dev/null || true
-        stashed=true
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        die "Working tree has local changes; review them before updating."
     fi
 
     # Fetch latest
@@ -646,7 +342,7 @@ do_update() {
     echo ""
 
     # Pull
-    if ! git pull "$GIT_REMOTE" "$GIT_BRANCH" 2>/dev/null; then
+    if ! git pull --ff-only "$GIT_REMOTE" "$GIT_BRANCH" 2>/dev/null; then
         log_error "git pull failed"
         return 1
     fi
@@ -796,7 +492,6 @@ install_systemd() {
         setup_proxy
         check_prerequisites
         setup_venv
-        setup_model
     fi
 
     # --- Create whisper system user ---
@@ -844,17 +539,8 @@ install_systemd() {
     local RW_PATHS="${LOG_DIR_VAL} ${TEMP_DIR_VAL}"
     [ -n "$STORAGE_PATH_VAL" ] && RW_PATHS="${RW_PATHS} ${STORAGE_PATH_VAL}"
 
-    # Build ReadOnlyPaths — model dir should be read-only for defense-in-depth
-    local MODEL_PATH_FULL="${MODEL_PATH}"
-    # If MODEL_PATH is relative, make it absolute under SCRIPT_DIR
-    case "$MODEL_PATH_FULL" in
-        /*) ;;  # already absolute
-        *)  MODEL_PATH_FULL="${SCRIPT_DIR}/${MODEL_PATH_FULL}" ;;
-    esac
-    local RO_PATHS="${MODEL_PATH_FULL}"
-
-    log_info "ReadWritePaths: ${RW_PATHS}"
-    log_info "ReadOnlyPaths:  ${RO_PATHS}"
+    # There are no downloaded model files in the cloud-backed service.
+    local RO_PATHS="${SCRIPT_DIR}/app"
 
     # --- Copy unit files ---
     sudo cp "${SVC_DIR}/whisper-asr.service" /etc/systemd/system/
@@ -881,15 +567,15 @@ install_systemd() {
     log_info "Enabling whisper-asr.service..."
     sudo systemctl enable whisper-asr.service
 
-    log_info "Enabling whisper-asr-update.timer..."
-    sudo systemctl enable whisper-asr-update.timer
+    log_info "Auto-update timer remains opt-in."
+    # Auto-update timer is opt-in; do not enable it during service setup.
 
     # --- Start services ---
     log_info "Starting whisper-asr.service..."
     sudo systemctl start whisper-asr.service || log_warn "Service start failed — check 'sudo journalctl -u whisper-asr -f'"
 
-    log_info "Starting whisper-asr-update.timer..."
-    sudo systemctl start whisper-asr-update.timer || log_warn "Timer start failed"
+    log_info "Auto-update timer was not started."
+    # Enable manually only after reviewing the update policy.
 
     log_info "Systemd units installed and started."
     echo ""
@@ -918,7 +604,6 @@ main() {
             setup_proxy
             check_prerequisites
             setup_venv
-            setup_model
             log_info "Setup complete. Run 'bash deploy.sh start' to start the server."
             ;;
 
@@ -926,7 +611,6 @@ main() {
             setup_proxy
             check_prerequisites
             setup_venv
-            setup_model
             start_server
             ;;
 
@@ -952,8 +636,8 @@ main() {
 
         update)
             setup_proxy
-            do_update
-            local result=$?
+            local result=0
+            do_update || result=$?
             if [ "$result" = "2" ]; then
                 # If running as root (e.g., from systemd update service), fix file ownership
                 # so the main service (which runs as whisper) can read updated files
@@ -1004,7 +688,7 @@ main() {
             ;;
 
         *)
-            echo "Whisper ASR API — Deployment Script"
+            echo "StepFun Cloud ASR API — Deployment Script"
             echo ""
             echo "Usage: bash deploy.sh <command> [options]"
             echo ""
@@ -1026,11 +710,11 @@ main() {
             echo "  GIT_BRANCH            Git branch to track (default: master)"
             echo ""
             echo "Environment (.env or export):"
-            echo "  MODEL_DOWNLOAD_URL   URL to download model archive"
-            echo "  HF_MODEL_ID          HuggingFace model ID for conversion"
+            echo "  OPENAI_API_KEY       StepFun key (server-only)"
+            echo "  ASR_MODEL            StepFun model ID"
             echo "  HTTP_PROXY           Proxy for pip/downloads"
             echo "  PORT                 Server port (default: 8080)"
-            echo "  MODEL_PATH           CTranslate2 model directory"
+            echo "  OPENAI_BASE_URL      Defaults to https://api.stepfun.com/v1"
             echo ""
             echo "First time: copy .env.example to .env and configure."
             exit 0

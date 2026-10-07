@@ -1,4 +1,4 @@
-# Whisper ASR API — Production Dependencies
+# StepFun ASR API — Production Dependencies
 # Install: pip install -r requirements.txt
 #
 # Versions are pinned for reproducible deployments (B-14).
@@ -8,9 +8,6 @@
 # Core
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-
-# Whisper
-faster-whisper==1.1.1
 
 # Configuration
 pydantic-settings==2.7.1
@@ -34,5 +31,5 @@ aiofiles==23.2.1
 sqlalchemy[asyncio]==2.0.36
 asyncpg==0.30.0
 
-# HTTP client (for callbacks to main backend)
+# HTTP client (StepFun inference and callbacks)
 httpx==0.28.1

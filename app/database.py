@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import AsyncGenerator
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -81,9 +82,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             ...
     """
     if _session_factory is None:
-        raise RuntimeError(
-            "Database not configured. Set DATABASE_URL to enable database features."
-        )
+        raise HTTPException(status_code=503, detail="Database not configured. Set DATABASE_URL to enable database features.")
 
     async with _session_factory() as session:
         try:

@@ -1,3 +1,2 @@
-# 模型下载地址 — deploy.sh 会自动读取此文件 https://huggingface.co/revoice-resonance/asr
-https://storage.itedev.com/revoice-resonance-models/whisper-large-v3-turbo-finetuned.tar
-
+# Deprecated: this fork uses https://api.stepfun.com/v1 and does not download local models.
+# Configure OPENAI_API_KEY in a private .env file. Never put credentials in this file.

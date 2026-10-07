@@ -1,7 +1,5 @@
 """Transcription endpoint — OpenAI-compatible POST /v1/audio/transcriptions."""
 
-from __future__ import annotations
-
 from typing import Literal
 
 import structlog
@@ -16,6 +14,7 @@ from app.schemas.responses import (
     TranscriptionSegment,
     VerboseTranscriptionResponse,
 )
+from app.services.transcriber import SpeechServiceError
 from app.services.upload_pipeline import process_upload, validate_content_length
 
 logger = structlog.get_logger(__name__)
@@ -66,6 +65,10 @@ async def transcribe(
     Authentication is handled by the upstream API gateway — no Bearer token
     validation is performed at this layer.
     """
+    worker = request.app.state.worker
+    if not worker.is_ready:
+        raise HTTPException(status_code=503, detail="Cloud speech is not configured or not ready. Set OPENAI_API_KEY.")
+
     # Validate language
     lang = language.strip()
 
@@ -76,13 +79,16 @@ async def transcribe(
     decoded = await process_upload(file)
     audio = decoded.audio
 
-    # Submit to GPU worker
-    worker = request.app.state.worker
+    # Submit to the cloud worker
     client_id = request.client.host if request.client else "unknown"
     try:
         result = await worker.submit(
             audio, language=lang, temperature=temperature, client_id=client_id
         )
+    except SpeechServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid or oversized decoded audio") from None
     except RuntimeError as exc:
         # Worker is shutting down or not running — map to 503 (C-1)
         raise HTTPException(
